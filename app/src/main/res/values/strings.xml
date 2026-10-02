@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Candy</string>
+
+    <string name="notification_channel_name">连接状态</string>
+    <string name="notification_channel_description">显示 candy 虚拟网络的连接状态</string>
+    <string name="notification_connecting">正在连接…</string>
+    <string name="notification_connected">已连接</string>
+    <string name="notification_disconnected">已断开</string>
+    <string name="notification_action_disconnect">断开</string>
+</resources>

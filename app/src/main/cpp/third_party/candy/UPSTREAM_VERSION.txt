@@ -1,0 +1,5 @@
+Source: https://github.com/lanthora/candy
+Ref: master
+Project version: 6.1.11
+Only candy/include and candy/src are vendored here; cmake/CMakeLists of
+upstream are intentionally NOT used (see app/src/main/cpp/CMakeLists.txt).

@@ -1,0 +1,432 @@
+// SPDX-License-Identifier: MIT
+#include "websocket/client.h"
+#include "core/client.h"
+#include "core/message.h"
+#include "core/net.h"
+#include "core/version.h"
+#include "utils/hex.h"
+#include "utils/log.h"
+#include "utils/time.h"
+#include "websocket/message.h"
+#include <Poco/Format.h>
+#include <Poco/Net/HTTPMessage.h>
+#include <Poco/Net/HTTPRequest.h>
+#include <Poco/Net/HTTPResponse.h>
+#include <Poco/Net/HTTPSClientSession.h>
+#include <Poco/Timespan.h>
+#include <Poco/URI.h>
+#include <memory>
+
+namespace candy {
+
+int WebSocketClient::setName(const std::string &name) {
+    this->name = name;
+    return 0;
+}
+
+int WebSocketClient::setPassword(const std::string &password) {
+    this->password = password;
+    return 0;
+}
+
+int WebSocketClient::setWsServerUri(const std::string &uri) {
+    this->wsServerUri = uri;
+    return 0;
+}
+
+int WebSocketClient::setExptTunAddress(const std::string &cidr) {
+    this->exptTunCidr = cidr;
+    return 0;
+}
+
+int WebSocketClient::setAddress(const std::string &cidr) {
+    this->tunCidr = cidr;
+    return 0;
+}
+
+int WebSocketClient::setVirtualMac(const std::string &vmac) {
+    this->vmac = vmac;
+    return 0;
+}
+
+std::string WebSocketClient::getTunCidr() const {
+    return this->tunCidr;
+}
+
+int WebSocketClient::run(Client *client) {
+    this->client = client;
+
+    if (connect()) {
+        candy::logger().fatal("websocket client connect failed");
+        return -1;
+    }
+
+    sendVirtualMacMsg();
+    if (this->tunCidr.empty()) {
+        sendExptTunMsg();
+    } else {
+        sendAuthMsg();
+    }
+
+    this->msgThread = std::thread([&] {
+        candy::logger().debug("start thread: websocket client msg");
+        try {
+            while (getClient().isRunning()) {
+                handleWsQueue();
+            }
+            getClient().shutdown();
+        } catch (const std::exception &e) {
+            candy::logger().error(Poco::format("websocket msg thread exception: %s", std::string(e.what())));
+            getClient().shutdown();
+        }
+        candy::logger().debug("stop thread: websocket client msg");
+    });
+
+    this->wsThread = std::thread([&] {
+        candy::logger().debug("start thread: websocket client ws");
+        while (getClient().isRunning()) {
+            if (handleWsConn()) {
+                break;
+            }
+        }
+        getClient().shutdown();
+        candy::logger().debug("stop thread: websocket client ws");
+    });
+
+    return 0;
+}
+
+int WebSocketClient::wait() {
+    if (this->msgThread.joinable()) {
+        this->msgThread.join();
+    }
+    if (this->wsThread.joinable()) {
+        this->wsThread.join();
+    }
+    return 0;
+}
+
+void WebSocketClient::handleWsQueue() {
+    Msg msg = this->client->getWsMsgQueue().read();
+    switch (msg.kind) {
+    case MsgKind::TIMEOUT:
+        break;
+    case MsgKind::PACKET:
+        handlePacket(std::move(msg));
+        break;
+    case MsgKind::PUBINFO:
+        handlePubInfo(std::move(msg));
+        break;
+    case MsgKind::DISCOVERY:
+        handleDiscovery(std::move(msg));
+        break;
+    default:
+        candy::logger().warning(Poco::format("unexcepted websocket message type: %d", static_cast<int>(msg.kind)));
+        break;
+    }
+}
+
+void WebSocketClient::handlePacket(Msg msg) {
+    IP4Header *header = (IP4Header *)msg.data.data();
+
+    msg.data.insert(0, 1, WsMsgKind::FORWARD);
+    sendFrame(msg.data);
+}
+
+void WebSocketClient::handlePubInfo(Msg msg) {
+    CoreMsg::PubInfo *info = (CoreMsg::PubInfo *)(msg.data.data());
+    if (info->local) {
+        WsMsg::ConnLocal buffer;
+        buffer.ge.src = info->src;
+        buffer.ge.dst = info->dst;
+        buffer.ip = info->ip;
+        buffer.port = hton(info->port);
+        sendFrame(&buffer, sizeof(buffer));
+    } else {
+        WsMsg::Conn buffer;
+        buffer.src = info->src;
+        buffer.dst = info->dst;
+        buffer.ip = info->ip;
+        buffer.port = hton(info->port);
+        sendFrame(&buffer, sizeof(buffer));
+    }
+}
+
+void WebSocketClient::handleDiscovery(Msg msg) {
+    sendDiscoveryMsg(IP4("255.255.255.255"));
+}
+
+int WebSocketClient::handleWsConn() {
+    try {
+        std::string buffer;
+        int flags = 0;
+
+        if (!this->ws->poll(Poco::Timespan(1, 0), Poco::Net::Socket::SELECT_READ | Poco::Net::Socket::SELECT_ERROR)) {
+            if (bootTime() - this->timestamp > 30000) {
+                candy::logger().warning("websocket pong timeout");
+                return -1;
+            }
+            if (bootTime() - this->timestamp > 15000) {
+                sendPingMessage();
+            }
+            return 0;
+        }
+
+        if (this->ws->getError()) {
+            candy::logger().warning(Poco::format("websocket connection error: %d", this->ws->getError()));
+            return -1;
+        }
+
+        buffer.resize(1500);
+        int length = this->ws->receiveFrame(buffer.data(), buffer.size(), flags);
+        if (length == 0 && flags == 0) {
+            candy::logger().information("abnormal disconnect");
+            return -1;
+        }
+        if ((flags & Poco::Net::WebSocket::FRAME_OP_BITMASK) == Poco::Net::WebSocket::FRAME_OP_PING) {
+            this->timestamp = bootTime();
+            flags = (int)Poco::Net::WebSocket::FRAME_FLAG_FIN | (int)Poco::Net::WebSocket::FRAME_OP_PONG;
+            sendFrame(buffer.data(), length, flags);
+            return 0;
+        }
+        if ((flags & Poco::Net::WebSocket::FRAME_OP_BITMASK) == Poco::Net::WebSocket::FRAME_OP_PONG) {
+            this->timestamp = bootTime();
+            return 0;
+        }
+        if ((flags & Poco::Net::WebSocket::FRAME_OP_BITMASK) == Poco::Net::WebSocket::FRAME_OP_CLOSE) {
+            candy::logger().information(Poco::format("websocket close: %s", buffer));
+            return -1;
+        }
+        if (length > 0) {
+            this->timestamp = bootTime();
+            buffer.resize(length);
+            handleWsMsg(std::move(buffer));
+            return 0;
+        }
+        return 0;
+    } catch (std::exception &e) {
+        candy::logger().warning(Poco::format("handle ws conn failed: %s", std::string(e.what())));
+        return -1;
+    }
+}
+
+void WebSocketClient::handleWsMsg(std::string buffer) {
+    uint8_t msgKind = buffer.front();
+    switch (msgKind) {
+    case WsMsgKind::FORWARD:
+        handleForwardMsg(std::move(buffer));
+        break;
+    case WsMsgKind::EXPTTUN:
+        handleExptTunMsg(std::move(buffer));
+        break;
+    case WsMsgKind::UDP4CONN:
+        handleUdp4ConnMsg(std::move(buffer));
+        break;
+    case WsMsgKind::DISCOVERY:
+        handleDiscoveryMsg(std::move(buffer));
+        break;
+    case WsMsgKind::ROUTE:
+        handleRouteMsg(std::move(buffer));
+        break;
+    case WsMsgKind::GENERAL:
+        handleGeneralMsg(std::move(buffer));
+        break;
+    default:
+        candy::logger().debug(Poco::format("unknown websocket message kind: %u", msgKind));
+        break;
+    }
+}
+
+void WebSocketClient::handleForwardMsg(std::string buffer) {
+    if (buffer.size() < sizeof(WsMsg::Forward)) {
+        candy::logger().warning(Poco::format("invalid forward message: %s", to_hex(buffer)));
+        return;
+    }
+    // Remove the 1-byte type field
+    buffer.erase(0, 1);
+    // Try to establish a peer-to-peer connection with the source address
+    IP4Header *header = (IP4Header *)buffer.data();
+    // Each relayed packet from the server triggers a P2P attempt,
+    // since server forwarding is a high-latency operation
+    this->client->getPeerMsgQueue().write(Msg(MsgKind::TRYP2P, header->saddr.toString()));
+    // Move the packet to the TUN module last, since std::move is destructive
+    this->client->getTunMsgQueue().write(Msg(MsgKind::PACKET, std::move(buffer)));
+}
+
+void WebSocketClient::handleExptTunMsg(std::string buffer) {
+    if (buffer.size() < sizeof(WsMsg::ExptTun)) {
+        candy::logger().warning(Poco::format("invalid expt tun message: %s", to_hex(buffer)));
+        return;
+    }
+    WsMsg::ExptTun *header = (WsMsg::ExptTun *)buffer.data();
+    Address exptTun(header->cidr);
+    this->tunCidr = exptTun.toCidr();
+    sendAuthMsg();
+}
+
+void WebSocketClient::handleUdp4ConnMsg(std::string buffer) {
+    if (buffer.size() < sizeof(WsMsg::Conn)) {
+        candy::logger().warning(Poco::format("invalid udp4conn message: %s", to_hex(buffer)));
+        return;
+    }
+    WsMsg::Conn *header = (WsMsg::Conn *)buffer.data();
+    CoreMsg::PubInfo info = {.src = header->src, .dst = header->dst, .ip = header->ip, .port = ntoh(header->port)};
+    this->client->getPeerMsgQueue().write(Msg(MsgKind::PUBINFO, std::string((char *)(&info), sizeof(info))));
+}
+
+void WebSocketClient::handleDiscoveryMsg(std::string buffer) {
+    if (buffer.size() < sizeof(WsMsg::Discovery)) {
+        candy::logger().warning(Poco::format("invalid discovery message: %s", to_hex(buffer)));
+        return;
+    }
+    WsMsg::Discovery *header = (WsMsg::Discovery *)buffer.data();
+    if (header->dst == IP4("255.255.255.255")) {
+        sendDiscoveryMsg(header->src);
+    }
+    this->client->getPeerMsgQueue().write(Msg(MsgKind::TRYP2P, header->src.toString()));
+}
+
+void WebSocketClient::handleRouteMsg(std::string buffer) {
+    if (buffer.size() < sizeof(WsMsg::SysRoute)) {
+        candy::logger().warning(Poco::format("invalid route message: %s", to_hex(buffer)));
+        return;
+    }
+    WsMsg::SysRoute *header = (WsMsg::SysRoute *)buffer.data();
+    SysRouteEntry *rt = header->rtTable;
+    for (uint8_t idx = 0; idx < header->size; ++idx) {
+        this->client->getTunMsgQueue().write(Msg(MsgKind::SYSRT, std::string((char *)(rt + idx), sizeof(SysRouteEntry))));
+        this->client->getPeerMsgQueue().write(Msg(MsgKind::SYSRT));
+    }
+}
+
+void WebSocketClient::handleGeneralMsg(std::string buffer) {
+    if (buffer.size() < sizeof(WsMsg::ConnLocal)) {
+        candy::logger().warning(Poco::format("invalid udp4conn local message: %s", to_hex(buffer)));
+        return;
+    }
+    WsMsg::ConnLocal *header = (WsMsg::ConnLocal *)buffer.data();
+    CoreMsg::PubInfo info = {
+        .src = header->ge.src,
+        .dst = header->ge.dst,
+        .ip = header->ip,
+        .port = ntoh(header->port),
+        .local = true,
+    };
+    this->client->getPeerMsgQueue().write(Msg(MsgKind::PUBINFO, std::string((char *)(&info), sizeof(info))));
+}
+
+void WebSocketClient::sendFrame(const std::string &buffer, int flags) {
+    sendFrame(buffer.c_str(), buffer.size(), flags);
+}
+
+void WebSocketClient::sendFrame(const void *buffer, int length, int flags) {
+    if (this->ws) {
+        try {
+            this->ws->sendFrame(buffer, length, flags);
+        } catch (std::exception &e) {
+            candy::logger().fatal(Poco::format("websocket send frame failed: %s", std::string(e.what())));
+        }
+    }
+}
+
+void WebSocketClient::sendVirtualMacMsg() {
+    WsMsg::VMac buffer(this->vmac);
+    buffer.updateHash(this->password);
+    sendFrame(&buffer, sizeof(buffer));
+}
+
+void WebSocketClient::sendExptTunMsg() {
+    Address exptTun(this->exptTunCidr);
+    WsMsg::ExptTun buffer(exptTun.toCidr());
+    buffer.updateHash(this->password);
+    sendFrame(&buffer, sizeof(buffer));
+}
+
+void WebSocketClient::sendAuthMsg() {
+    Address address(this->tunCidr);
+    WsMsg::Auth buffer(address.Host());
+    buffer.updateHash(this->password);
+    sendFrame(&buffer, sizeof(buffer));
+    this->client->getTunMsgQueue().write(Msg(MsgKind::TUNADDR, address.toCidr()));
+    this->client->getPeerMsgQueue().write(Msg(MsgKind::TUNADDR, address.toCidr()));
+    sendPingMessage();
+}
+
+void WebSocketClient::sendDiscoveryMsg(IP4 dst) {
+    Address address(this->tunCidr);
+
+    WsMsg::Discovery buffer;
+    buffer.dst = dst;
+    buffer.src = address.Host();
+
+    sendFrame(&buffer, sizeof(buffer));
+}
+
+std::string WebSocketClient::hostName() {
+    char hostname[64] = {0};
+    if (!gethostname(hostname, sizeof(hostname))) {
+        return std::string(hostname, strnlen(hostname, sizeof(hostname)));
+    }
+    return "";
+}
+
+void WebSocketClient::sendPingMessage() {
+    int flags = (int)Poco::Net::WebSocket::FRAME_FLAG_FIN | (int)Poco::Net::WebSocket::FRAME_OP_PING;
+    sendFrame(pingMessage, flags);
+}
+
+int WebSocketClient::connect() {
+    std::shared_ptr<Poco::URI> uri;
+    try {
+        uri = std::make_shared<Poco::URI>(wsServerUri);
+    } catch (std::exception &e) {
+        candy::logger().fatal(Poco::format("invalid websocket server: %s: %s", wsServerUri, std::string(e.what())));
+        return -1;
+    }
+
+    try {
+        const std::string path = uri->getPath().empty() ? "/" : uri->getPath();
+        Poco::Net::HTTPRequest request(Poco::Net::HTTPRequest::HTTP_GET, path, Poco::Net::HTTPMessage::HTTP_1_1);
+        Poco::Net::HTTPResponse response;
+        if (uri->getScheme() == "wss") {
+            using Poco::Net::Context;
+            Context::Ptr context = new Context(Context::TLS_CLIENT_USE, "", "", "", Context::VERIFY_NONE);
+            Poco::Net::HTTPSClientSession cs(uri->getHost(), uri->getPort(), context);
+            this->ws = std::make_shared<Poco::Net::WebSocket>(cs, request, response);
+        } else if (uri->getScheme() == "ws") {
+            Poco::Net::HTTPClientSession cs(uri->getHost(), uri->getPort());
+            this->ws = std::make_shared<Poco::Net::WebSocket>(cs, request, response);
+        } else {
+            candy::logger().fatal(Poco::format("invalid websocket scheme: %s", wsServerUri));
+            return -1;
+        }
+        // Blocking mode may cause receiveFrame to hang and use 100% CPU
+        this->ws->setBlocking(false);
+        this->timestamp = bootTime();
+        this->pingMessage = "candy::" + std::string(CANDY_SYSTEM) + "::" + std::string(CANDY_VERSION) + "::" + hostName();
+        candy::logger().debug(Poco::format("client info: %s", this->pingMessage));
+        return 0;
+    } catch (std::exception &e) {
+        candy::logger().fatal(Poco::format("websocket connect failed: %s", std::string(e.what())));
+        return -1;
+    }
+}
+
+int WebSocketClient::disconnect() {
+    try {
+        if (this->ws) {
+            this->ws->shutdown();
+            this->ws->close();
+            this->ws.reset();
+        }
+    } catch (std::exception &e) {
+        candy::logger().debug(Poco::format("websocket disconnect failed: %s", std::string(e.what())));
+    }
+    return 0;
+}
+
+Client &WebSocketClient::getClient() {
+    return *this->client;
+}
+
+} // namespace candy

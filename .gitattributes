@@ -1,0 +1,15 @@
+# Normalize line endings: store LF in the repo on every platform
+* text=auto eol=lf
+
+# Windows scripts may keep CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binaries
+*.png binary
+*.jpg binary
+*.webp binary
+*.apk binary
+*.jar binary
+*.so binary
+*.a binary
